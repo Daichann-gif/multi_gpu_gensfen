@@ -1,31 +1,68 @@
 # =========================================================
-# Ultra Stable Multi GPU Gensfen
+# Ultra Stable Multi GPU Selfplay Gensfen
 #
-# FIXED VERSION
+# FINAL STM VERSION
 #
-# Fixes:
+# DESIGN
 # ---------------------------------------------------------
-# - NO infinite buffer growth
-# - NO RAM explosion
-# - Fixed-size search tree
-# - Seed recycling
-# - Chunk memory reset
-# - Multi GPU
-# - TensorRT / CUDA
-# - Billion-scale stable generation
+# score/result are BOTH STM-relative
+#
+# EXAMPLE
+# ---------------------------------------------------------
+# final winner = BLACK
+#
+# BLACK turn:
+#   score  +500
+#   result  1
+#
+# WHITE turn:
+#   score  -500
+#   result -1
+#
+# IMPORTANT
+# ---------------------------------------------------------
+# This is the NORMAL AlphaZero/dlshogi style.
+#
+# score:
+#   current position evaluation
+#
+# result:
+#   final game outcome
+#
+# Both flip with side-to-move.
+#
+# WEAK CLAMP
+# ---------------------------------------------------------
+# contradictory scores are weakened
+# but NOT forcibly flipped
+#
+# +800 -> +200
+# -600 -> -150
+#
+# FIXES
+# ---------------------------------------------------------
+# [FIXED] sign confusion
+# [FIXED] NaN softmax
+# [FIXED] TRT cache collision
+# [FIXED] multi GPU freeze
+# [FIXED] None unpack crash
+# [FIXED] score=0 spam
+#
 # =========================================================
 
 import argparse
-import gc
 import os
-from concurrent.futures import ThreadPoolExecutor
-
+import gc
+import random
 import numpy as np
+
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
 
 from cshogi import (
     Board,
     PackedSfenValue,
+    BLACK,
 )
 
 from cshogi.dlshogi import (
@@ -45,207 +82,221 @@ def parse_args():
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
-        "output_prefix",
-        type=str
+        "output_prefix"
+    )
+
+    parser.add_argument(
+        "--model-path",
+        required=True
+    )
+
+    parser.add_argument(
+        "--sfen-path",
+        required=True
     )
 
     parser.add_argument(
         "--devices",
-        type=str,
         default="0"
     )
 
     parser.add_argument(
         "--total-positions",
         type=int,
-        default=1000000000
+        default=1000000
     )
 
     parser.add_argument(
         "--chunk-positions",
         type=int,
-        default=100000000
-    )
-
-    parser.add_argument(
-        "--seed-size",
-        type=int,
-        default=1000000
-    )
-
-    parser.add_argument(
-        "--sfen-path",
-        type=str,
-        default=None
-    )
-
-    parser.add_argument(
-        "--policy-moves",
-        type=int,
-        default=2
-    )
-
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=1.0
+        default=100000
     )
 
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=32768
-    )
-
-    #
-    # IMPORTANT
-    # fixed maximum tree size
-    #
-    parser.add_argument(
-        "--buffer-size",
-        type=int,
-        default=2000000
+        default=64
     )
 
     parser.add_argument(
-        "--score-scaling",
+        "--temperature",
         type=float,
-        default=600.0
+        default=0.3
     )
 
-    parser = utils.configure_session_args(
-        parser
+    parser.add_argument(
+        "--max-ply",
+        type=int,
+        default=256
+    )
+
+    parser.add_argument(
+        "--value-scale",
+        type=float,
+        default=2000.0
+    )
+
+    parser.add_argument(
+        "--draw-threshold",
+        type=float,
+        default=0.10
+    )
+
+    parser.add_argument(
+        "--enable-tensorrt",
+        action="store_true"
+    )
+
+    parser.add_argument(
+        "--enable-cuda",
+        action="store_true"
     )
 
     return parser.parse_args()
 
 
 # =========================================================
-# duplicate checker
+# random sfen reader
 # =========================================================
 
-class DuplicateChecker:
+class RandomSfenReader:
 
-    def __init__(self):
+    def __init__(self, path):
 
-        self.hashes = set()
+        self.offsets = []
 
-    def mark(self, h):
+        print("building sfen offsets...")
 
-        self.hashes.add(h)
+        with open(path, "rb") as f:
 
-    def check(self, h):
+            while True:
 
-        return h in self.hashes
+                off = f.tell()
 
+                line = f.readline()
 
-# =========================================================
-# FIXED SIZE BUFFER
-# =========================================================
+                if not line:
+                    break
 
-class BatchBuffer:
+                if line.strip():
+                    self.offsets.append(off)
 
-    def __init__(
-            self,
-            capacity,
-            batch_size,
-            dtype
-    ):
-
-        self.capacity = max(
-            capacity,
-            batch_size
+        print(
+            f"loaded {len(self.offsets)} sfens"
         )
 
-        self.batch_size = batch_size
+        self.fp = open(path, "rb")
 
-        self.dtype = dtype
+    def random(self):
 
-        #
-        # FIXED MEMORY
-        #
-        self.data = np.empty(
-            self.capacity,
-            dtype=dtype
-        )
+        while True:
 
-        self.size = 0
+            try:
 
-    def push(self, arr):
+                off = random.choice(
+                    self.offsets
+                )
 
-        if len(arr) == 0:
-            return
+                self.fp.seek(off)
 
-        #
-        # IMPORTANT
-        # NO MEMORY EXPANSION
-        #
-        free_space = (
-            len(self.data)
-            - self.size
-        )
+                line = self.fp.readline()
 
-        if free_space <= 0:
-            return
+                s = line.decode(
+                    errors="ignore"
+                ).strip()
 
-        #
-        # random truncation
-        #
-        if len(arr) > free_space:
+                if s.startswith("sfen "):
+                    s = s[5:]
 
-            indices = np.random.choice(
-                len(arr),
-                size=free_space,
-                replace=False
-            )
+                if s:
+                    return s
 
-            arr = arr[indices]
-
-        self.data[
-            self.size:
-            self.size + len(arr)
-        ] = arr
-
-        self.size += len(arr)
-
-    def pop(self):
-
-        if self.size == 0:
-
-            return np.empty(
-                0,
-                dtype=self.dtype
-            )
-
-        n = min(
-            self.batch_size,
-            self.size
-        )
-
-        result = self.data[
-            self.size - n:
-            self.size
-        ].copy()
-
-        self.size -= n
-
-        return result
-
-    def empty(self):
-
-        return self.size == 0
+            except:
+                continue
 
 
 # =========================================================
-# softmax
+# sigmoid -> [-1,+1]
 # =========================================================
 
-def softmax(
-        x,
-        temperature=1.0
+def value_to_black(v):
+
+    v = float(v)
+
+    v = np.nan_to_num(v)
+
+    v = np.clip(v, 0.0, 1.0)
+
+    return (
+        v * 2.0 - 1.0
+    )
+
+
+# =========================================================
+# black result
+# =========================================================
+
+def black_result(vb, threshold):
+
+    if vb > threshold:
+        return 1
+
+    if vb < -threshold:
+        return -1
+
+    return 0
+
+
+# =========================================================
+# STM score
+# =========================================================
+
+def stm_score(
+        value_black,
+        turn,
+        scale
 ):
 
-    x = x.astype(np.float32)
+    if turn == BLACK:
+        stm = value_black
+    else:
+        stm = -value_black
+
+    return int(stm * scale)
+
+
+# =========================================================
+# STM result
+# =========================================================
+
+def stm_result(
+        final_black_result,
+        turn
+):
+
+    if turn == BLACK:
+        return final_black_result
+    else:
+        return -final_black_result
+
+
+# =========================================================
+# safe softmax
+# =========================================================
+
+def softmax(x, temperature):
+
+    x = np.asarray(
+        x,
+        dtype=np.float32
+    )
+
+    x = np.nan_to_num(x)
+
+    temperature = max(
+        temperature,
+        1e-6
+    )
 
     x /= temperature
 
@@ -253,200 +304,400 @@ def softmax(
 
     exp_x = np.exp(x)
 
-    return exp_x / (
-        np.sum(exp_x) + 1e-8
-    )
+    s = np.sum(exp_x)
+
+    if (
+        not np.isfinite(s)
+        or s <= 0
+    ):
+        return np.ones_like(
+            exp_x
+        ) / len(exp_x)
+
+    return exp_x / s
 
 
 # =========================================================
-# features
+# choose move
 # =========================================================
 
-def allocate_input_features(
-        batch_size
+def choose_move(
+        board,
+        logits,
+        temperature
 ):
 
-    input1 = np.empty(
-        (batch_size, 62, 9, 9),
-        dtype=np.float32
+    moves = list(
+        board.legal_moves
     )
 
-    input2 = np.empty(
-        (batch_size, 57, 9, 9),
-        dtype=np.float32
+    if len(moves) == 0:
+        return None
+
+    labels = [
+        make_move_label(
+            m,
+            board.turn
+        )
+        for m in moves
+    ]
+
+    legal_logits = logits[
+        labels
+    ]
+
+    probs = softmax(
+        legal_logits,
+        temperature
     )
 
-    return input1, input2
+    return np.random.choice(
+        moves,
+        p=probs
+    )
 
 
 # =========================================================
-# sessions
+# create sessions
 # =========================================================
 
 def create_sessions(args):
 
-    device_ids = [
+    ids = [
         int(x.strip())
         for x in args.devices.split(",")
     ]
 
     sessions = []
 
-    for device_id in device_ids:
+    for device_id in ids:
 
         print(
-            f"Creating GPU session "
-            f"{device_id}"
+            f"creating gpu {device_id}"
         )
 
         args.device_id = device_id
 
-        session = utils.create_session(
-            args
+        #
+        # IMPORTANT
+        #
+        args.trt_engine_cache_path = (
+            f"trt_cache_gpu_{device_id}"
         )
 
-        sessions.append(session)
+        os.makedirs(
+            args.trt_engine_cache_path,
+            exist_ok=True
+        )
+
+        sessions.append(
+            utils.create_session(args)
+        )
 
     return sessions
 
 
 # =========================================================
-# inference
+# parallel inference
 # =========================================================
 
-def parallel_inference(
+def inference_parallel(
         sessions,
-        input1,
-        input2
+        x1,
+        x2
 ):
 
-    split_indices = np.array_split(
-        np.arange(len(input1)),
+    batch = len(x1)
+
+    splits = np.array_split(
+        np.arange(batch),
         len(sessions)
     )
 
-    value_outputs = [None] * len(sessions)
-    logit_outputs = [None] * len(sessions)
-
     def worker(
-            gpu_idx,
-            indices
+            gpu_id,
+            idx
     ):
 
-        if len(indices) == 0:
-            return
+        if len(idx) == 0:
+            return (
+                idx,
+                None,
+                None
+            )
 
-        values, logits = utils.inference(
-            input1[indices],
-            input2[indices],
-            sessions[gpu_idx]
-        )
+        try:
 
-        value_outputs[gpu_idx] = values
-        logit_outputs[gpu_idx] = logits
+            v, l = utils.inference(
+                x1[idx],
+                x2[idx],
+                sessions[gpu_id]
+            )
+
+            v = np.nan_to_num(
+                np.asarray(v).reshape(-1)
+            )
+
+            l = np.nan_to_num(
+                np.asarray(l)
+            )
+
+            return (
+                idx,
+                v,
+                l
+            )
+
+        except Exception as e:
+
+            print(
+                f"[gpu {gpu_id}] inference failed:",
+                e
+            )
+
+            return (
+                idx,
+                None,
+                None
+            )
+
+    results = []
 
     with ThreadPoolExecutor(
             max_workers=len(sessions)
-    ) as executor:
+    ) as ex:
 
         futures = []
 
-        for gpu_idx, indices in enumerate(
-                split_indices
-        ):
+        for gpu_id, idx in enumerate(splits):
 
             futures.append(
-                executor.submit(
+                ex.submit(
                     worker,
-                    gpu_idx,
-                    indices
+                    gpu_id,
+                    idx
                 )
             )
 
-        for future in futures:
-            future.result()
+        for f in futures:
+            results.append(
+                f.result()
+            )
 
-    batch_values = np.concatenate(
-        [
-            x for x in value_outputs
-            if x is not None
-        ],
-        axis=0
+    values = np.zeros(
+        batch,
+        dtype=np.float32
     )
 
-    batch_logits = np.concatenate(
-        [
-            x for x in logit_outputs
-            if x is not None
-        ],
-        axis=0
+    logits = np.zeros(
+        (batch, 2187),
+        dtype=np.float32
     )
 
-    return batch_values, batch_logits
+    for idx, v, l in results:
+
+        if (
+            v is None
+            or l is None
+        ):
+            continue
+
+        values[idx] = v
+        logits[idx] = l
+
+    return values, logits
 
 
 # =========================================================
-# load sfens
+# game
 # =========================================================
 
-def load_initial_sfens(path):
+class Game:
 
-    if path is None:
+    def __init__(self, board):
 
-        return [
-            "lnsgkgsnl/1r5b1/"
-            "ppppppppp/9/9/9/"
-            "PPPPPPPPP/1B5R1/"
-            "LNSGKGSNL b - 1"
-        ]
+        self.board = board
 
-    sfens = []
+        self.history = []
 
-    with open(
-            path,
-            "r",
-            encoding="utf-8-sig"
-    ) as f:
+        self.finished = False
 
-        for line in f:
-
-            line = line.strip()
-
-            if not line:
-                continue
-
-            if line.startswith("sfen "):
-                line = line[5:]
-
-            sfens.append(line)
-
-    return sfens
+        self.final_value_black = 0.0
 
 
 # =========================================================
-# convert
+# play step
 # =========================================================
 
-def convert_to_psfens(sfens):
+def play_step(
+        game,
+        logits,
+        value_black,
+        args
+):
 
-    board = Board()
+    board = game.board
 
-    psfens = np.empty(
-        len(sfens),
+    game.final_value_black = (
+        value_black
+    )
+
+    #
+    # repetition
+    #
+    if board.is_draw():
+
+        game.finished = True
+
+        game.final_value_black = 0.0
+
+        return
+
+    #
+    # mate
+    #
+    if board.is_game_over():
+
+        game.finished = True
+
+        return
+
+    move = choose_move(
+        board,
+        logits,
+        args.temperature
+    )
+
+    if move is None:
+
+        game.finished = True
+
+        return
+
+    #
+    # save PSV
+    #
+    ps = np.empty(
+        1,
         dtype=PackedSfenValue
     )
 
-    for i, sfen in enumerate(sfens):
+    board.to_psfen(ps)
 
-        board.set_sfen(sfen)
+    ps["move"][0] = make_move_label(
+        move,
+        board.turn
+    )
 
-        board.to_psfen(
-            psfens[i:i + 1]
+    #
+    # STM score
+    #
+    ps["score"][0] = stm_score(
+        value_black,
+        board.turn,
+        args.value_scale
+    )
+
+    ps["gamePly"][0] = (
+        board.move_number
+    )
+
+    #
+    # save turn
+    #
+    ps["padding"][0] = (
+        board.turn
+    )
+
+    game.history.append(
+        ps.copy()
+    )
+
+    #
+    # play move
+    #
+    board.push(move)
+
+    #
+    # max ply
+    #
+    if (
+        board.move_number
+        >= args.max_ply
+    ):
+
+        game.finished = True
+
+
+# =========================================================
+# finalize
+# =========================================================
+
+def finalize(
+        game,
+        args
+):
+
+    #
+    # BLACK fixed result
+    #
+    final_black_result = black_result(
+        game.final_value_black,
+        args.draw_threshold
+    )
+
+    out = []
+
+    for ps in game.history:
+
+        turn = ps["padding"][0]
+
+        #
+        # STM result
+        #
+        result = stm_result(
+            final_black_result,
+            turn
         )
 
-        psfens["gamePly"][i] = 1
+        score = int(
+            ps["score"][0]
+        )
 
-    return psfens
+        # =================================================
+        # WEAK CLAMP
+        # =================================================
+
+        if result > 0 and score < 0:
+
+            score = int(score * 0.25)
+
+        elif result < 0 and score > 0:
+
+            score = int(score * 0.25)
+
+        #
+        # draw soften
+        #
+        if result == 0:
+
+            score = int(score * 0.25)
+
+        #
+        # final clamp
+        #
+        score = max(
+            -32000,
+            min(32000, score)
+        )
+
+        ps["score"][0] = score
+
+        ps["game_result"][0] = result
+
+        out.append(ps)
+
+    return out
 
 
 # =========================================================
@@ -456,277 +707,132 @@ def convert_to_psfens(sfens):
 def generate_chunk(
         args,
         sessions,
-        output_file,
-        chunk_positions,
-        seed_sfens
+        reader,
+        out_file,
+        chunk_size
 ):
 
-    board = Board()
+    batch = args.batch_size
 
-    input1, input2 = \
-        allocate_input_features(
-            args.batch_size
-        )
-
-    generated = np.empty(
-        args.batch_size
-        * args.policy_moves,
-        dtype=PackedSfenValue
+    x1 = np.empty(
+        (batch, 62, 9, 9),
+        dtype=np.float32
     )
 
-    duplicate_checker = \
-        DuplicateChecker()
-
-    sfens_buffer = BatchBuffer(
-        args.buffer_size,
-        args.batch_size,
-        dtype=PackedSfenValue
+    x2 = np.empty(
+        (batch, 57, 9, 9),
+        dtype=np.float32
     )
 
-    #
-    # initial tree
-    #
-    sfens_buffer.push(
-        seed_sfens
-    )
+    generated = 0
 
-    generated_positions = 0
-
-    #
-    # fixed seed pool
-    #
-    next_seed_pool = []
-
-    next_seed_count = 0
-
-    with open(output_file, "wb") as f_out:
+    with open(out_file, "wb") as f:
 
         with tqdm(
-                total=chunk_positions,
-                desc=os.path.basename(
-                    output_file
-                )
-        ) as bar:
+                total=chunk_size
+        ) as pbar:
 
-            while (
-                    generated_positions
-                    < chunk_positions
-            ):
+            while generated < chunk_size:
 
-                if sfens_buffer.empty():
-
-                    print(
-                        "Buffer empty"
-                    )
-
-                    break
-
-                sfens = sfens_buffer.pop()
+                games = []
 
                 #
-                # features
+                # init games
                 #
-                for i, sfen in enumerate(
-                        sfens["sfen"]
-                ):
+                for _ in range(batch):
 
-                    board.set_psfen(sfen)
+                    while True:
 
-                    make_input_features(
-                        board,
-                        input1[i],
-                        input2[i]
-                    )
+                        try:
 
-                #
-                # inference
-                #
-                batch_values, batch_logits = \
-                    parallel_inference(
-                        sessions,
-                        input1[:len(sfens)],
-                        input2[:len(sfens)]
-                    )
+                            b = Board()
 
-                scores = (
-                    batch_values.flatten()
-                    * args.score_scaling
-                )
-
-                pos_count = 0
-
-                #
-                # expand
-                #
-                for i, logits in enumerate(
-                        batch_logits
-                ):
-
-                    board.set_psfen(
-                        sfens["sfen"][i]
-                    )
-
-                    duplicate_checker.mark(
-                        board.zobrist_hash()
-                    )
-
-                    legal_moves = list(
-                        board.legal_moves
-                    )
-
-                    if len(legal_moves) == 0:
-                        continue
-
-                    labels = [
-                        make_move_label(
-                            move,
-                            board.turn
-                        )
-                        for move in legal_moves
-                    ]
-
-                    legal_logits = logits[
-                        labels
-                    ]
-
-                    probs = softmax(
-                        legal_logits,
-                        args.temperature
-                    )
-
-                    sampled_moves = \
-                        np.random.choice(
-                            legal_moves,
-                            size=min(
-                                args.policy_moves,
-                                len(legal_moves)
-                            ),
-                            replace=False,
-                            p=probs
-                        )
-
-                    for move in sampled_moves:
-
-                        board.push(move)
-
-                        h = board.zobrist_hash()
-
-                        if not duplicate_checker.check(h):
-
-                            board.to_psfen(
-                                generated[
-                                    pos_count:
-                                    pos_count + 1
-                                ]
+                            b.set_sfen(
+                                reader.random()
                             )
 
-                            generated["score"][
-                                pos_count
-                            ] = int(scores[i])
-
-                            generated["gamePly"][
-                                pos_count
-                            ] = (
-                                sfens["gamePly"][i]
-                                + 1
+                            games.append(
+                                Game(b)
                             )
 
-                            generated["padding"][
-                                pos_count
-                            ] = 1
+                            break
 
-                            pos_count += 1
-
-                        board.pop()
+                        except:
+                            continue
 
                 #
-                # no generated
+                # selfplay
                 #
-                if pos_count == 0:
-                    continue
+                while True:
 
-                #
-                # write
-                #
-                sfens.tofile(f_out)
+                    active = [
+                        g for g in games
+                        if not g.finished
+                    ]
 
-                #
-                # next tree
-                #
-                new_sfens = generated[
-                    :pos_count
-                ].copy()
+                    if len(active) == 0:
+                        break
 
-                #
-                # randomize tree
-                #
-                np.random.shuffle(
-                    new_sfens
-                )
+                    #
+                    # features
+                    #
+                    for i, g in enumerate(active):
 
-                #
-                # IMPORTANT
-                # fixed search tree size
-                #
-                sfens_buffer.push(
-                    new_sfens
-                )
+                        make_input_features(
+                            g.board,
+                            x1[i],
+                            x2[i]
+                        )
 
-                #
-                # LIMITED seed recycling
-                #
-                if (
-                        next_seed_count
-                        < args.seed_size
-                ):
-
-                    take = min(
-                        10000,
-                        len(new_sfens),
-                        args.seed_size
-                        - next_seed_count
+                    #
+                    # inference
+                    #
+                    vals, logs = (
+                        inference_parallel(
+                            sessions,
+                            x1[:len(active)],
+                            x2[:len(active)]
+                        )
                     )
 
-                    next_seed_pool.append(
-                        new_sfens[:take]
+                    #
+                    # play
+                    #
+                    for i, g in enumerate(active):
+
+                        vb = value_to_black(
+                            vals[i]
+                        )
+
+                        play_step(
+                            g,
+                            logs[i],
+                            vb,
+                            args
+                        )
+
+                #
+                # save
+                #
+                for g in games:
+
+                    out = finalize(
+                        g,
+                        args
                     )
 
-                    next_seed_count += take
+                    for ps in out:
+                        ps.tofile(f)
 
-                generated_positions += \
-                    len(sfens)
+                    n = len(out)
 
-                bar.update(
-                    len(sfens)
-                )
+                    generated += n
 
-    #
-    # next chunk seeds
-    #
-    if len(next_seed_pool) == 0:
+                    pbar.update(n)
 
-        next_seed_sfens = seed_sfens
-
-    else:
-
-        next_seed_sfens = np.concatenate(
-            next_seed_pool,
-            axis=0
-        )
-
-    #
-    # cleanup
-    #
-    del sfens_buffer
-    del duplicate_checker
-    del generated
-    del input1
-    del input2
-    del next_seed_pool
+                gc.collect()
 
     gc.collect()
-
-    return next_seed_sfens
 
 
 # =========================================================
@@ -738,134 +844,67 @@ def main():
     args = parse_args()
 
     print("--------------------------------")
-
-    print(
-        f"Devices            : "
-        f"{args.devices}"
-    )
-
-    print(
-        f"Total Positions    : "
-        f"{args.total_positions}"
-    )
-
-    print(
-        f"Chunk Positions    : "
-        f"{args.chunk_positions}"
-    )
-
-    print(
-        f"Buffer Size        : "
-        f"{args.buffer_size}"
-    )
-
-    print(
-        f"Seed Size          : "
-        f"{args.seed_size}"
-    )
-
+    print("FINAL STM SELFPLAY")
     print("--------------------------------")
 
-    #
-    # load once
-    #
-    initial_sfens = load_initial_sfens(
+    print(
+        f"devices: {args.devices}"
+    )
+
+    print(
+        f"total positions: {args.total_positions}"
+    )
+
+    print(
+        f"chunk positions: {args.chunk_positions}"
+    )
+
+    sessions = create_sessions(
+        args
+    )
+
+    reader = RandomSfenReader(
         args.sfen_path
     )
 
-    seed_sfens = convert_to_psfens(
-        initial_sfens
-    )
-
-    #
-    # chunk count
-    #
-    num_chunks = (
+    chunks = (
         args.total_positions
         + args.chunk_positions
         - 1
     ) // args.chunk_positions
 
-    for chunk_idx in range(num_chunks):
-
-        sessions = create_sessions(
-            args
-        )
-
-        start_pos = (
-            chunk_idx
-            * args.chunk_positions
-        )
+    for i in range(chunks):
 
         remain = (
             args.total_positions
-            - start_pos
+            - i * args.chunk_positions
         )
 
-        current_chunk = min(
-            args.chunk_positions,
-            remain
+        chunk_size = min(
+            remain,
+            args.chunk_positions
         )
 
-        output_file = (
+        out_file = (
             f"{args.output_prefix}_"
-            f"{chunk_idx + 1:04d}.bin"
-        )
-
-        print("\n================================")
-
-        print(
-            f"Chunk "
-            f"{chunk_idx + 1}"
-            f"/{num_chunks}"
+            f"{i:04d}.bin"
         )
 
         print(
-            f"Output : "
-            f"{output_file}"
+            f"\nchunk {i+1}/{chunks}"
         )
 
-        print(
-            f"Positions : "
-            f"{current_chunk}"
-        )
-
-        print("================================\n")
-
-        #
-        # generate
-        #
-        seed_sfens = generate_chunk(
+        generate_chunk(
             args,
             sessions,
-            output_file,
-            current_chunk,
-            seed_sfens
+            reader,
+            out_file,
+            chunk_size
         )
-
-        #
-        # cleanup TensorRT
-        #
-        del sessions
 
         gc.collect()
 
-        print(
-            f"\nChunk "
-            f"{chunk_idx + 1} "
-            f"finished."
-        )
-
-        print(
-            f"Next seed size : "
-            f"{len(seed_sfens)}"
-        )
-
-        print(
-            "Memory cleaned.\n"
-        )
-
-    print("\nALL DONE")
+    print("\nDONE")
 
 
 if __name__ == "__main__":
